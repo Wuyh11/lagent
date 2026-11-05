@@ -415,6 +415,14 @@ class DBoxProviderTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, 'confirm'):
             await provider.configure_network('main', external_targets=['10.1.2.3/32'])
 
+    async def test_network_policy_rejects_cidrs_wider_than_one_host(self):
+        provider = await self.provider(lambda request: httpx.Response(500))
+        provider.owned_env_ids.add('main')
+        for target in ['0.0.0.0/0', '10.0.0.0/8', '10.1.2.0/24', '10.1.2.2/31']:
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, '/32'):
+                await provider.configure_network('main', external_targets=[target])
+        self.assertFalse(self.requests)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -278,7 +278,10 @@ class DBoxProvider:
             if not isinstance(target, str) or not target or any(c.isspace() for c in target):
                 raise ValueError("External targets must be IPv4 CIDRs or hostnames")
             if "/" in target:
-                ipaddress.IPv4Network(target)
+                # Only exact hosts: a wider CIDR (up to 0.0.0.0/0) would bypass
+                # the deny-by-default egress this policy exists to enforce.
+                if ipaddress.IPv4Network(target).prefixlen != 32:
+                    raise ValueError("External CIDR targets must be exact IPv4 /32 hosts")
             elif not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", target):
                 raise ValueError("External targets must be IPv4 CIDRs or hostnames")
         exceptions = ["sandbox:" + peer for peer in peers]

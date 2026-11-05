@@ -61,6 +61,8 @@ async def _safe_error_code(response):
 class DBoxSandboxClient(SandboxClient):
     """Preserve SandboxClient operations through an authenticated execd call."""
 
+    process_probe_deadline_sec = 30.0
+
     def __init__(self, url: str, *, auth_headers, execd_token: str, sandbox_id: str, provider):
         super().__init__(url, sandbox_id=sandbox_id, lifecycle_provider=provider)
         self._auth_headers = auth_headers
@@ -79,6 +81,34 @@ class DBoxSandboxClient(SandboxClient):
             + repr(timeout) + "); "
             "print('DBOX_RESPONSE:'+base64.b64encode(response.read()).decode())"
         )
+        text = await self._execd_stdout("python3 -c " + shlex.quote(code), timeout + 15)
+        if not text.startswith("DBOX_RESPONSE:"):
+            raise DBoxTransportError("DBox execution response incomplete or failed", status_code=200,
+                                     phase="execd_response_stream", response_received=True)
+        try:
+            result = json.loads(base64.b64decode(text[len("DBOX_RESPONSE:"):], validate=True))
+            if not isinstance(result, dict):
+                raise ValueError("not a response object")
+            return result
+        except Exception:
+            raise RuntimeError("DBox execution returned invalid response data") from None
+
+    async def _run_process_probe(self, command: str) -> int | None:
+        # Probe through execd directly: the loopback remote-exec server also
+        # serves the agent's tool commands, so a busy queue must not delay or
+        # fail process monitoring. Report the probe's status on stdout because
+        # execd's own completion is the printf below.
+        try:
+            async with asyncio.timeout(self.process_probe_deadline_sec):
+                text = await self._execd_stdout(command + "; printf 'DBOX_PID:%s\\n' \"$?\"", 20)
+        except TimeoutError:
+            raise DBoxTransportError("DBox process probe deadline exceeded", phase="process_probe",
+                                     transport_error_type="TimeoutError") from None
+        marker, _, value = text.partition(":")
+        return int(value) if marker == "DBOX_PID" and value in {"0", "1", "2"} else None
+
+    async def _execd_stdout(self, command: str, timeout: float) -> str:
+        """Read one execd command stream without exposing commands or credentials."""
         headers = self._auth_headers()
         headers["X-EXECD-ACCESS-TOKEN"] = self._execd_token
         stdout = []
@@ -93,8 +123,7 @@ class DBoxSandboxClient(SandboxClient):
                 response_received=response_status is not None, **details)
         try:
             async with self._client.stream(
-                "POST", "command", headers=headers,
-                json={"command": "python3 -c " + shlex.quote(code)}, timeout=timeout + 15,
+                "POST", "command", headers=headers, json={"command": command}, timeout=timeout,
             ) as response:
                 response_status = response.status_code
                 if response.status_code != 200:
@@ -135,16 +164,9 @@ class DBoxSandboxClient(SandboxClient):
                           phase=phase, transport_error_type=type(exc).__name__) from None
         finally:
             headers.clear()
-        text = "".join(stdout).strip()
-        if failed or not complete or not text.startswith("DBOX_RESPONSE:"):
+        if failed or not complete:
             raise failure("DBox execution response incomplete or failed", phase="execd_response_stream")
-        try:
-            result = json.loads(base64.b64decode(text[len("DBOX_RESPONSE:"):], validate=True))
-            if not isinstance(result, dict):
-                raise ValueError("not a response object")
-            return result
-        except Exception:
-            raise RuntimeError("DBox execution returned invalid response data") from None
+        return "".join(stdout).strip()
 
     async def execute(self, command: str, cwd: str = "/root", timeout_sec: int = 60, detach: bool = False) -> dict:
         return await self._remote_request(
