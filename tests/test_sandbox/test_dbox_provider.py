@@ -394,6 +394,27 @@ class DBoxProviderTests(unittest.IsolatedAsyncioTestCase):
                 await provider.delete(value)
         self.assertFalse(self.requests)
 
+    async def test_network_policy_declares_protocol_and_rejects_changed_allowlist(self):
+        async def handler(request):
+            policy = json.loads(request.content)
+            self.assertEqual(policy['ingress']['rules'][0]['protocol'], 'tcp')
+            return httpx.Response(200, json={'status': 'ok', 'policy': policy})
+        provider = await self.provider(handler)
+        provider.owned_env_ids.update({'main', 'peer'})
+        result = await provider.configure_network('main', peer_ids=['peer'], external_targets=['10.1.2.3/32'])
+        self.assertEqual(result['policy']['egress'], [
+            {'action': 'allow', 'target': 'sandbox:peer'}, {'action': 'allow', 'target': '10.1.2.3/32'}])
+        result = await provider.configure_network('main', external_targets=['model.test'])
+        self.assertNotIn('except', result['policy']['ingress']['rules'][0])
+        await provider._client.aclose()
+        def wrong_policy(request):
+            policy = json.loads(request.content)
+            policy['egress'].append({'action': 'allow', 'target': '0.0.0.0/0'})
+            return httpx.Response(200, json={'status': 'ok', 'policy': policy})
+        provider._client = httpx.AsyncClient(base_url=provider.api_url, transport=httpx.MockTransport(wrong_policy))
+        with self.assertRaisesRegex(RuntimeError, 'confirm'):
+            await provider.configure_network('main', external_targets=['10.1.2.3/32'])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ipaddress
 import math
 from pathlib import Path
 import re
@@ -259,34 +260,43 @@ class DBoxProvider:
         return self._normalize(self._json(response), env_id)
 
     async def configure_peer(self, env_id: str, peer_id: str, *, external_targets: list[str] | None = None) -> dict:
-        """Restrict an owned sandbox to its Trial peer and trusted model targets."""
-        for value in (env_id, peer_id):
+        """Compatibility entry point for a single peer."""
+        return await self.configure_network(env_id, peer_ids=[peer_id], external_targets=external_targets)
+
+    async def configure_network(self, env_id: str, *, peer_ids: list[str] | None = None,
+                                external_targets: list[str] | None = None) -> dict:
+        """Set and verify deny-by-default egress for any owned sandbox."""
+        peers = list(dict.fromkeys(peer_ids or []))
+        for value in [env_id, *peers]:
             self._check_id(value)
             if value not in self.owned_env_ids:
-                raise ValueError("Network policy may reference only this provider's owned Trial members")
-        if env_id == peer_id:
+                raise ValueError("Network policy may reference only this provider's owned sandboxes")
+        if env_id in peers:
             raise ValueError("Sandbox cannot reference itself")
-        targets = list(external_targets or [])
-        if any(not isinstance(t, str) or not t or any(c.isspace() for c in t)
-               or ":" in t or "/" in t and not t.endswith("/32") for t in targets):
-            raise ValueError("External targets must be trusted IPv4 CIDRs or hostnames")
+        targets = list(dict.fromkeys(external_targets or []))
+        for target in targets:
+            if not isinstance(target, str) or not target or any(c.isspace() for c in target):
+                raise ValueError("External targets must be IPv4 CIDRs or hostnames")
+            if "/" in target:
+                ipaddress.IPv4Network(target)
+            elif not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", target):
+                raise ValueError("External targets must be IPv4 CIDRs or hostnames")
+        exceptions = ["sandbox:" + peer for peer in peers]
+        ingress = {"action": "deny", "from": "sandbox:any", "protocol": "tcp"}
+        if exceptions:
+            ingress["except"] = exceptions
         policy = {"defaultAction": "deny", "egress": [
-            {"action": "allow", "target": "sandbox:" + peer_id},
+            *[{"action": "allow", "target": peer} for peer in exceptions],
             *[{"action": "allow", "target": target} for target in targets],
-        ], "ingress": {"defaultAction": "allow", "rules": [
-            {"action": "deny", "from": "sandbox:any", "except": ["sandbox:" + peer_id]},
-        ]}}
+        ], "ingress": {"defaultAction": "allow", "rules": [ingress]}}
         response = await self._request("PUT", f"/v1/sandboxes/{env_id}/networkpolicy",
                                        payload=policy, timeout=self._get_timeout)
         result = self._json(response)
-        if response.status_code != 200 or result.get("status") != "ok" or result.get("policy") != policy:
-            # Platform may normalize protocol fields. Require peer and targets
-            # rather than accepting a successful HTTP response without policy.
-            actual = result.get("policy", {})
-            if (response.status_code != 200 or result.get("status") != "ok"
-                    or actual.get("defaultAction") != "deny" or actual.get("egress") != policy["egress"]
-                    or actual.get("ingress", {}).get("rules", [{}])[0].get("except") != ["sandbox:" + peer_id]):
-                raise RuntimeError("DBox did not confirm the requested Trial network policy")
+        actual = result.get("policy", {})
+        if (response.status_code != 200 or result.get("status") != "ok"
+                or actual.get("defaultAction") != "deny" or actual.get("egress") != policy["egress"]
+                or actual.get("ingress") != policy["ingress"]):
+            raise RuntimeError("DBox did not confirm the requested network policy")
         return result
 
     async def delete(self, env_id: str) -> None:
