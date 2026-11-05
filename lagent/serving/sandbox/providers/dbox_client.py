@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import shlex
+import time
 
 import httpx
 
@@ -20,12 +21,48 @@ from .base import SandboxClient
 class DBoxTransportError(httpx.HTTPError, RuntimeError):
     """Sanitized data-plane failure compatible with existing PID polling retries."""
 
+    def __init__(self, message, *, status_code=None, error_code=None, phase="execd_transport",
+                 transport_error_type=None, elapsed_seconds=None, response_received=False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.phase = phase
+        self.transport_error_type = transport_error_type
+        self.elapsed_seconds = elapsed_seconds
+        self.response_received = response_received
+
+
+async def _safe_error_code(response):
+    """Classify a bounded error body without retaining free-form server text."""
+    data = bytearray()
+    async for chunk in response.aiter_bytes(chunk_size=4096):
+        data.extend(chunk[:4096 - len(data)])
+        if len(data) >= 4096:
+            break
+    known = {"SANDBOX_NOT_RUNNING", "SANDBOX_NOT_FOUND", "INVALID_STATE", "RATE_LIMITED",
+             "QUOTA_EXCEEDED", "UNAUTHORIZED", "FORBIDDEN", "PROXY_POOL_EXHAUSTED",
+             "BACKEND_CONNECTION_FAILED", "BACKEND_TIMEOUT", "BACKEND_RESPONSE_FAILED",
+             "SERVICE_UNAVAILABLE", "PORT_NOT_FOUND"}
+    try:
+        body = json.loads(data)
+        error = body.get("detail") or body.get("error") or body
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and code.rsplit("::", 1)[-1] in known:
+            return code.rsplit("::", 1)[-1]
+    except (ValueError, AttributeError):
+        pass
+    if bytes(data).strip().lower().rstrip(b".") in {
+        b"sandbox is not running", b"sandbox not running", b"sandbox is not ready",
+    }:
+        return "SANDBOX_NOT_RUNNING"
+    return None
+
 
 class DBoxSandboxClient(SandboxClient):
     """Preserve SandboxClient operations through an authenticated execd call."""
 
     def __init__(self, url: str, *, auth_headers, execd_token: str, sandbox_id: str, provider):
-        super().__init__(url)
+        super().__init__(url, sandbox_id=sandbox_id, lifecycle_provider=provider)
         self._auth_headers = auth_headers
         self._execd_token = execd_token
         self.sandbox_id = sandbox_id
@@ -42,31 +79,36 @@ class DBoxSandboxClient(SandboxClient):
             + repr(timeout) + "); "
             "print('DBOX_RESPONSE:'+base64.b64encode(response.read()).decode())"
         )
-        text = await self._execd_stdout("python3 -c " + shlex.quote(code), timeout + 15)
-        if not text.startswith("DBOX_RESPONSE:"):
-            raise DBoxTransportError("DBox execution response incomplete or failed")
-        try:
-            result = json.loads(base64.b64decode(text[len("DBOX_RESPONSE:"):], validate=True))
-            if not isinstance(result, dict):
-                raise ValueError("not a response object")
-            return result
-        except Exception:
-            raise RuntimeError("DBox execution returned invalid response data") from None
-
-    async def _execd_stdout(self, command: str, timeout: float) -> str:
-        """Read a completed execd stream without exposing commands or credentials."""
         headers = self._auth_headers()
         headers["X-EXECD-ACCESS-TOKEN"] = self._execd_token
         stdout = []
         complete = False
         failed = False
+        started = time.monotonic()
+        response_status = None
+        phase = "execd_response_headers"
+        def failure(message, **details):
+            return DBoxTransportError(message, status_code=response_status,
+                elapsed_seconds=round(time.monotonic() - started, 6),
+                response_received=response_status is not None, **details)
         try:
             async with self._client.stream(
                 "POST", "command", headers=headers,
-                json={"command": command}, timeout=timeout,
+                json={"command": "python3 -c " + shlex.quote(code)}, timeout=timeout + 15,
             ) as response:
+                response_status = response.status_code
                 if response.status_code != 200:
-                    raise DBoxTransportError(f"DBox execd returned HTTP {response.status_code}")
+                    try:
+                        code = await asyncio.wait_for(_safe_error_code(response), timeout=2.0)
+                    except (httpx.HTTPError, TimeoutError):
+                        # An incomplete diagnostic body must not erase the HTTP
+                        # status already observed from the control endpoint.
+                        code = None
+                    raise failure(
+                        f"DBox execd returned HTTP {response.status_code}" + (f" ({code})" if code else ""),
+                        error_code=code, phase="execd_proxy",
+                    )
+                phase = "execd_response_stream"
                 async for line in response.aiter_lines():
                     if not line.strip() or line.startswith(":"):
                         continue
@@ -76,54 +118,42 @@ class DBoxSandboxClient(SandboxClient):
                         event = json.loads(line)
                     except ValueError:
                         continue
-                    if not isinstance(event, dict):
-                        raise DBoxTransportError("Invalid execd event")
                     if event.get("type") == "stdout":
                         stdout.append(event.get("text", ""))
                     elif event.get("type") in {"stderr", "error", "execution_error"}:
                         failed = True
                     elif event.get("type") == "execution_complete":
-                        if event.get("exit_code", 0) != 0:
-                            failed = True
                         complete = True
+                        # This event terminates the execution protocol. Waiting
+                        # for HTTP EOF can time out after a completed command and
+                        # holds a proxy pool connection for no useful work.
+                        break
         except DBoxTransportError:
             raise
         except Exception as exc:
-            raise DBoxTransportError(f"DBox authenticated transport failed ({type(exc).__name__})") from None
+            raise failure(f"DBox authenticated transport failed ({type(exc).__name__})",
+                          phase=phase, transport_error_type=type(exc).__name__) from None
         finally:
             headers.clear()
-        if failed or not complete:
-            raise DBoxTransportError("DBox execution response incomplete or failed")
-        return "".join(stdout).strip()
-
-    async def is_pid_running(self, pid: int) -> bool:
-        """Check PID through execd directly, avoiding the busy remote-exec queue."""
-        pid = int(pid)
-        if pid <= 0:
-            raise ValueError("PID must be positive")
-        code = (
-            "import os\n"
-            "try:\n"
-            f" os.kill({pid}, 0)\n"
-            "except ProcessLookupError:\n"
-            " print('DBOX_PID:0')\n"
-            "else:\n"
-            " print('DBOX_PID:1')\n"
-        )
+        text = "".join(stdout).strip()
+        if failed or not complete or not text.startswith("DBOX_RESPONSE:"):
+            raise failure("DBox execution response incomplete or failed", phase="execd_response_stream")
         try:
-            async with asyncio.timeout(30):
-                text = await self._execd_stdout("python3 -c " + shlex.quote(code), 30)
-        except TimeoutError:
-            raise DBoxTransportError("DBox PID check deadline exceeded") from None
-        if text not in {"DBOX_PID:0", "DBOX_PID:1"}:
-            raise DBoxTransportError("Invalid DBox PID check result")
-        return text == "DBOX_PID:1"
+            result = json.loads(base64.b64decode(text[len("DBOX_RESPONSE:"):], validate=True))
+            if not isinstance(result, dict):
+                raise ValueError("not a response object")
+            return result
+        except Exception:
+            raise RuntimeError("DBox execution returned invalid response data") from None
 
     async def execute(self, command: str, cwd: str = "/root", timeout_sec: int = 60, detach: bool = False) -> dict:
         return await self._remote_request(
             "exec", {"command": command, "cwd": cwd, "timeout_sec": int(timeout_sec), "detach": detach},
             timeout=int(timeout_sec) + 10,
         )
+
+    def _process_probe_error(self) -> Exception:
+        return DBoxTransportError("DBox process probe returned no valid process state", phase="process_probe")
 
     async def upload_bytes(self, remote_path: str, content: bytes) -> dict:
         # execd invokes a shell: keep each command well below ARG_MAX. Assemble
